@@ -67,8 +67,8 @@ async function getSidecarPort() {
     // Sidecar not running yet
   }
 
-  // Spawn sidecar in background if not started by the IDE yet
-  const child = spawn(process.execPath, [SIDECAR_SCRIPT], {
+  // Spawn sidecar broker in background if not started yet
+  const child = spawn(process.execPath, [SIDECAR_SCRIPT, '--daemon'], {
     cwd: path.dirname(SIDECAR_SCRIPT),
     detached: true,
     stdio: 'ignore',

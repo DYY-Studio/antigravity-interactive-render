@@ -43,8 +43,13 @@ function ensureFormState(itemId) {
   return state.uiFormState.get(itemId);
 }
 
+const doFetch =
+  window.sidecar && typeof window.sidecar.fetch === 'function'
+    ? window.sidecar.fetch.bind(window.sidecar)
+    : window.fetch.bind(window);
+
 async function postJson(url, body) {
-  const res = await fetch(url, {
+  const res = await doFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -53,6 +58,7 @@ async function postJson(url, body) {
   if (!res.ok || data.ok === false) {
     throw new Error(data.error || `HTTP ${res.status}`);
   }
+  void pollState();
   return data;
 }
 
@@ -747,7 +753,11 @@ function renderHtmlPageView(item) {
   const iframe = document.createElement('iframe');
   iframe.className = 'render-iframe';
   iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
-  iframe.src = `/api/pages/${encodeURIComponent(item.id)}.html?t=${item.updatedAt}`;
+  if (item.renderedDoc) {
+    iframe.srcdoc = item.renderedDoc;
+  } else {
+    iframe.src = `/api/pages/${encodeURIComponent(item.id)}.html?t=${item.updatedAt}`;
+  }
   iframe.addEventListener('load', () => {
     if (state.annotating) {
       iframe.contentWindow?.postMessage({ type: 'openchamber:html-render:annotate-mode', enabled: true }, '*');
@@ -1020,10 +1030,14 @@ copyEmbedBtn.addEventListener('click', async () => {
 downloadBtn.addEventListener('click', () => {
   const active = getActiveItem();
   if (!active || active.kind !== 'html') return;
+  const doc = active.renderedDoc || active.html || '';
+  const blob = new Blob([doc], { type: 'text/html;charset=utf-8' });
+  const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = `/api/pages/${encodeURIComponent(active.id)}.html`;
+  a.href = blobUrl;
   a.download = `${(active.title || 'page').replace(/[^a-z0-9_-]+/gi, '-').toLowerCase()}.html`;
   a.click();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
 });
 
 themeBtn.addEventListener('click', () => {
@@ -1036,26 +1050,46 @@ clearBtn.addEventListener('click', () => {
   void postJson('/api/clear', {});
 });
 
-// Connect SSE stream
-function connectEvents() {
-  const es = new EventSource('/api/events');
-  es.addEventListener('state', (e) => {
-    try {
-      const payload = JSON.parse(e.data);
-      applyTheme(payload.theme);
-      state.activeId = payload.activeId;
-      state.serverPort = payload.serverPort;
-      state.waitingCount = payload.waitingCount || 0;
-      state.items = payload.items || [];
-      renderMainContent(false);
-    } catch {
-      // Ignore malformed frame
-    }
-  });
-  es.onerror = () => {
-    es.close();
-    setTimeout(connectEvents, 1500);
-  };
+function applyServerState(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  applyTheme(payload.theme);
+  state.activeId = payload.activeId;
+  state.serverPort = payload.serverPort;
+  state.waitingCount = payload.waitingCount || 0;
+  state.items = payload.items || [];
+  renderMainContent(false);
 }
 
-connectEvents();
+async function pollState() {
+  try {
+    const res = await doFetch('/api/state');
+    const payload = await res.json();
+    if (payload && payload.ok !== false) {
+      applyServerState(payload);
+    }
+  } catch {
+    // Ignore transient polling error
+  }
+}
+
+// Poll state for Sidecar SDK webview compatibility + SSE when available
+void pollState();
+setInterval(pollState, 1200);
+
+if (!window.sidecar && typeof EventSource === 'function') {
+  function connectEvents() {
+    const es = new EventSource('/api/events');
+    es.addEventListener('state', (e) => {
+      try {
+        applyServerState(JSON.parse(e.data));
+      } catch {
+        // Ignore malformed frame
+      }
+    });
+    es.onerror = () => {
+      es.close();
+      setTimeout(connectEvents, 2000);
+    };
+  }
+  connectEvents();
+}

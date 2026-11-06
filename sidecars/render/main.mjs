@@ -1,4 +1,6 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -28,28 +30,33 @@ import {
 } from './secret_vault.mjs';
 import { parseUiProgram } from './ui_blocks.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'interactive-render');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const GEMINI_DIR = process.env.ANTIGRAVITY_GEMINI_DIR || path.join(os.homedir(), '.gemini');
+export const DATA_DIR = path.join(GEMINI_DIR, 'antigravity', 'interactive-render');
 const SECRETS_DIR = path.join(DATA_DIR, 'secrets');
 const PAGES_DIR = path.join(DATA_DIR, 'pages');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
-const PORT_FILE = path.join(DATA_DIR, 'server.json');
+export const PORT_FILE = path.join(DATA_DIR, 'server.json');
+
+const PANEL_SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Cache-Control': 'no-store',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy':
+    "default-src 'self' 'unsafe-inline' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; frame-src 'self' about: data: blob: http://127.0.0.1:* http://localhost:*; connect-src 'self' http://127.0.0.1:* http://localhost:*;",
+};
 
 const secretVault = createSecretFiles({ directory: SECRETS_DIR });
 
-/**
- * In-memory state of rendered pages and secret requests.
- * Note: secret values are NEVER stored in items — only `{ status, label, reason }`
- * for UI status display.
- */
 const state = {
   theme: 'dark',
   activeId: null,
-  items: [], // max 50 items, newest first
+  items: [],
 };
 
 const sseClients = new Set();
-const waitingResolvers = new Map(); // id -> { resolve, reject, kind, cleanup }
+const waitingResolvers = new Map();
 
 function broadcast(event, payload) {
   const frame = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -68,31 +75,45 @@ function publicState(serverPort) {
     activeId: state.activeId,
     serverPort,
     waitingCount: state.items.filter((i) => i.status === 'waiting').length,
-    items: state.items.map((item) => ({
-      id: item.id,
-      kind: item.kind, // 'html' | 'ui' | 'secret'
-      title: item.title,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-      awaitAnswer: item.awaitAnswer,
-      status: item.status, // 'shown' | 'waiting' | 'answered' | 'declined' | 'cancelled' | 'error'
-      summary: item.summary ?? null,
-      answerData: item.kind === 'secret' ? null : (item.answerData ?? null),
-      annotations: item.annotations ?? [],
-      html: item.html ?? null,
-      uiSource: item.uiSource ?? null,
-      uiAst: item.uiAst ?? null,
-      uiErrors: item.uiErrors ?? null,
-      embedPath: item.embedPath ?? null,
-      secretMeta: item.secretMeta ?? null,
-    })),
+    items: state.items.map((item) => {
+      const renderedDoc =
+        item.kind === 'html' && item.html
+          ? buildHtmlRenderDocument(item.html, {
+              appearance: state.theme,
+              answerState: {
+                waiting: item.status === 'waiting',
+                answer: item.answerData ?? null,
+              },
+              pageId: item.id,
+              apiBaseUrl: `http://127.0.0.1:${serverPort}`,
+            })
+          : null;
+      return {
+        id: item.id,
+        kind: item.kind,
+        title: item.title,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+        awaitAnswer: item.awaitAnswer,
+        status: item.status,
+        summary: item.summary ?? null,
+        answerData: item.kind === 'secret' ? null : (item.answerData ?? null),
+        annotations: item.annotations ?? [],
+        html: item.html ?? null,
+        renderedDoc,
+        uiSource: item.uiSource ?? null,
+        uiAst: item.uiAst ?? null,
+        uiErrors: item.uiErrors ?? null,
+        embedPath: item.embedPath ?? null,
+        secretMeta: item.secretMeta ?? null,
+      };
+    }),
   };
 }
 
 async function saveStateToDisk() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    // Persist settled items (waiting items become 'cancelled' on server restart)
     const serializable = {
       theme: state.theme,
       activeId: state.activeId,
@@ -174,6 +195,7 @@ function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
@@ -198,18 +220,17 @@ async function writeStandaloneEmbedPage(item, serverPort) {
   return filePath;
 }
 
-async function startServer() {
+export async function startBrokerServer() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(PAGES_DIR, { recursive: true });
   await loadStateFromDisk();
   await secretVault.sweep().catch(() => {});
 
-  // Sweep expired secret files every hour
   setInterval(() => {
     void secretVault.sweep().catch(() => {});
   }, 60 * 60 * 1000).unref();
 
-  let serverPort = Number(process.env.PORT || 0);
+  let serverPort = 0;
 
   const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
@@ -226,7 +247,6 @@ async function startServer() {
     const pathname = url.pathname;
 
     try {
-      // 1. Static UI files
       if (req.method === 'GET' && pathname === '/favicon.ico') {
         const svg = await fs.readFile(path.join(__dirname, '..', '..', 'assets', 'logo.svg'), 'utf8').catch(() => '');
         res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'max-age=86400' });
@@ -246,7 +266,6 @@ async function startServer() {
         return;
       }
 
-      // 2. Standalone HTML page preview route
       if (req.method === 'GET' && pathname.startsWith('/api/pages/')) {
         const id = pathname.slice('/api/pages/'.length).replace(/\.html$/i, '');
         const item = state.items.find((i) => i.id === id);
@@ -272,7 +291,6 @@ async function startServer() {
         return;
       }
 
-      // 3. SSE Stream
       if (req.method === 'GET' && pathname === '/api/events') {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -286,13 +304,11 @@ async function startServer() {
         return;
       }
 
-      // 4. Get current state
       if (req.method === 'GET' && pathname === '/api/state') {
         sendJson(res, 200, { ok: true, ...publicState(serverPort) });
         return;
       }
 
-      // 5. Select active item or change theme
       if (req.method === 'POST' && pathname === '/api/select') {
         const body = await readJsonBody(req);
         if (typeof body.activeId === 'string') {
@@ -307,7 +323,6 @@ async function startServer() {
         return;
       }
 
-      // 6. Clear settled items
       if (req.method === 'POST' && pathname === '/api/clear') {
         state.items = state.items.filter((i) => i.status === 'waiting');
         state.activeId = state.items[0]?.id || null;
@@ -317,7 +332,6 @@ async function startServer() {
         return;
       }
 
-      // 7. Render a page (`html` or `ui`), optionally blocking for `awaitAnswer`
       if (req.method === 'POST' && pathname === '/api/render') {
         const body = await readJsonBody(req);
         const rawHtml = typeof body.html === 'string' ? body.html : '';
@@ -364,7 +378,6 @@ async function startServer() {
         if (isUi) {
           const parsedUi = parseUiProgram(rawUi);
           if (!parsedUi.ok) {
-            // Record the failed UI block and return ui-not-drawn immediately so the agent can self-heal
             const errItem = {
               id,
               kind: 'ui',
@@ -412,13 +425,11 @@ async function startServer() {
             return;
           }
 
-          // Wait for user's answer on the UI block
           const answerResult = await waitForItemResolution(id, req);
           sendJson(res, 200, { ok: true, data: answerResult });
           return;
         }
 
-        // HTML page path: inline local images within 25MB budget
         const { html: inlinedHtml, hiddenReport } = await inlineAndDescribeLocalImages(rawHtml, directory);
         const item = {
           id,
@@ -462,17 +473,17 @@ async function startServer() {
         return;
       }
 
-      // 8. Submit an answer, annotation, or skip for a rendered page
       if (req.method === 'POST' && pathname === '/api/render/answer') {
         const body = await readJsonBody(req);
         const pageId = typeof body.pageId === 'string' ? body.pageId.trim() : '';
-        const item = (pageId && state.items.find((i) => i.id === pageId)) || state.items.find((i) => i.status === 'waiting' && i.kind !== 'secret');
+        const item =
+          (pageId && state.items.find((i) => i.id === pageId)) ||
+          state.items.find((i) => i.status === 'waiting' && i.kind !== 'secret');
         if (!item) {
           sendJson(res, 404, { ok: false, error: 'No matching page found' });
           return;
         }
 
-        // Client reported UI block couldn't be drawn
         if (Array.isArray(body.notDrawn)) {
           const errors = body.notDrawn.map((e) => String(e).slice(0, 500)).slice(0, 20);
           updateItem(item.id, { status: 'error', uiErrors: errors }, serverPort);
@@ -490,7 +501,6 @@ async function startServer() {
           return;
         }
 
-        // User clicked "Skip / Answer in Chat"
         if (body.skipped === true) {
           const userNote = typeof body.note === 'string' ? body.note.trim() : '';
           updateItem(
@@ -519,7 +529,6 @@ async function startServer() {
           return;
         }
 
-        // User submitted visual annotations
         if (Array.isArray(body.annotations) && body.annotations.length > 0) {
           const summary =
             (typeof body.summary === 'string' && body.summary.trim()) ||
@@ -597,7 +606,6 @@ async function startServer() {
         return;
       }
 
-      // 9. Request a zero-context secret (`request_secret`)
       if (req.method === 'POST' && pathname === '/api/secret/request') {
         const body = await readJsonBody(req);
         let validated;
@@ -626,7 +634,6 @@ async function startServer() {
         addItem(item, serverPort);
 
         const result = await waitForItemResolution(id, req, async (settledValue) => {
-          // If the request aborted right as a file was saved, remove the orphan secret file
           const orphanFile = settledValue?.answer?.file;
           if (orphanFile) {
             await secretVault.remove(orphanFile).catch(() => {});
@@ -636,7 +643,6 @@ async function startServer() {
         return;
       }
 
-      // 10. Submit or decline a secret (`POST /api/secret/answer`)
       if (req.method === 'POST' && pathname === '/api/secret/answer') {
         const body = await readJsonBody(req);
         const id = typeof body.id === 'string' ? body.id.trim() : '';
@@ -754,23 +760,156 @@ async function startServer() {
   }
 
   await new Promise((resolve, reject) => {
-    server.listen(serverPort, '127.0.0.1', () => {
+    server.listen(0, '127.0.0.1', () => {
       const addr = server.address();
-      serverPort = typeof addr === 'object' && addr ? addr.port : serverPort;
+      serverPort = typeof addr === 'object' && addr ? addr.port : 0;
       resolve();
     });
     server.on('error', reject);
   });
 
-  await fs.writeFile(
-    PORT_FILE,
-    JSON.stringify({ port: serverPort, pid: process.pid, updatedAt: Date.now() }, null, 2),
-    'utf8',
-  );
-  console.log(JSON.stringify({ status: 'ready', port: serverPort }));
+  const info = { port: serverPort, pid: process.pid, updatedAt: Date.now() };
+  await fs.writeFile(PORT_FILE, JSON.stringify(info, null, 2), 'utf8');
+  return info;
 }
 
-startServer().catch((err) => {
-  console.error('[interactive-render sidecar] fatal:', err);
-  process.exit(1);
-});
+export function requestBroker(port, reqPath, method = 'GET', body = null, { longPoll = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const payload = body !== null ? Buffer.from(JSON.stringify(body), 'utf8') : null;
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: reqPath,
+        method,
+        headers: payload
+          ? {
+              'Content-Type': 'application/json',
+              'Content-Length': payload.length,
+            }
+          : {},
+        timeout: longPoll ? 0 : 15000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const text = Buffer.concat(chunks).toString('utf8');
+            resolve({ statusCode: res.statusCode || 200, data: text ? JSON.parse(text) : {} });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    if (!longPoll) {
+      req.on('timeout', () => req.destroy(new Error('Request to interactive-render broker timed out')));
+    }
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+export async function ensureBrokerRunning() {
+  try {
+    if (existsSync(PORT_FILE)) {
+      const info = JSON.parse(readFileSync(PORT_FILE, 'utf8'));
+      if (info && typeof info.port === 'number' && info.port > 0) {
+        const check = await requestBroker(info.port, '/api/state', 'GET');
+        if (check.statusCode === 200 && check.data?.ok) {
+          return info;
+        }
+      }
+    }
+  } catch {
+    // Broker not running yet
+  }
+
+  // If this process is the daemon itself, start in-process
+  if (process.argv.includes('--daemon') || !process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+    return startBrokerServer();
+  }
+
+  // Spawn detached daemon so the Broker outlives Sidecar UI restarts
+  const child = spawn(process.execPath, [__filename, '--daemon'], {
+    cwd: __dirname,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    try {
+      if (existsSync(PORT_FILE)) {
+        const info = JSON.parse(readFileSync(PORT_FILE, 'utf8'));
+        if (info?.port) {
+          const check = await requestBroker(info.port, '/api/state', 'GET');
+          if (check.statusCode === 200 && check.data?.ok) {
+            return info;
+          }
+        }
+      }
+    } catch {
+      // Wait for startup
+    }
+  }
+  return startBrokerServer();
+}
+
+const isMain = Boolean(
+  process.argv[1] &&
+    (process.platform === 'win32'
+      ? __filename.toLowerCase() === path.resolve(process.argv[1]).toLowerCase()
+      : __filename === path.resolve(process.argv[1])),
+);
+
+if (isMain && process.argv.includes('--daemon')) {
+  const info = await startBrokerServer();
+  console.log(JSON.stringify({ status: 'ready', port: info.port }));
+  setInterval(() => {}, 60000);
+} else if (isMain && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+  await ensureBrokerRunning();
+  const { Response, SidecarApp } = await import('sidecar_sdk');
+  const app = new SidecarApp();
+
+  const forward = async (reqPath, method, data) => {
+    const info = await ensureBrokerRunning();
+    const res = await requestBroker(info.port, reqPath, method, method === 'POST' ? data || {} : null);
+    return new Response(JSON.stringify(res.data), {
+      status: res.statusCode || 200,
+      contentType: 'application/json; charset=utf-8',
+      headers: PANEL_SECURITY_HEADERS,
+    });
+  };
+
+  app.page('/', () =>
+    new Response(readFileSync(path.join(__dirname, 'index.html'), 'utf8'), {
+      contentType: 'text/html; charset=utf-8',
+      headers: PANEL_SECURITY_HEADERS,
+    }),
+  );
+
+  app.page('/app.js', () =>
+    new Response(readFileSync(path.join(__dirname, 'app.js'), 'utf8'), {
+      contentType: 'application/javascript; charset=utf-8',
+      headers: PANEL_SECURITY_HEADERS,
+    }),
+  );
+
+  app.api('/api/state', (data) => forward('/api/state', 'GET', data), 'GET');
+  app.api('/api/select', (data) => forward('/api/select', 'POST', data), 'POST');
+  app.api('/api/clear', (data) => forward('/api/clear', 'POST', data), 'POST');
+  app.api('/api/render', (data) => forward('/api/render', 'POST', data), 'POST');
+  app.api('/api/render/answer', (data) => forward('/api/render/answer', 'POST', data), 'POST');
+  app.api('/api/secret/request', (data) => forward('/api/secret/request', 'POST', data), 'POST');
+  app.api('/api/secret/answer', (data) => forward('/api/secret/answer', 'POST', data), 'POST');
+
+  app.run();
+} else if (isMain) {
+  const info = await startBrokerServer();
+  console.log(JSON.stringify({ status: 'ready', port: info.port }));
+  setInterval(() => {}, 60000);
+}
