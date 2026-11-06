@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "interactive-render": {
+    "mcp": {
       "command": "node",
       "args": [
         "-e",

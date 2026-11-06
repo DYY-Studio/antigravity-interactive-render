@@ -1,6 +1,6 @@
 # Interactive Render & Secret Vault (`interactive-render`)
 
-Use the `interactive-render` MCP tools (`render_page`, `request_secret`, `render_status`) and the `[Render](sidecar://interactive-render/render/)` side panel whenever you need **two-way interactive UI forms/visualizations** or **zero-context secret collection**:
+Use the `interactive-render_mcp` MCP tools (`render_page`, `request_secret`, `render_status`) and the `[Render](sidecar://interactive-render/render/)` side panel whenever you need **two-way interactive UI forms/visualizations** or **zero-context secret collection**:
 
 1. **Zero-Context Secret Collection (`request_secret`)**:
    - **NEVER ask the user to paste an API key, token, or password in the chat**, as chat messages stay in the LLM context window and conversation transcript forever.
