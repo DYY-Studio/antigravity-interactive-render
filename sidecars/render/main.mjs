@@ -28,7 +28,7 @@ import {
   SECRET_MAX_VALUE_LENGTH,
   validateSecretRequestInput,
 } from './secret_vault.mjs';
-import { parseUiProgram } from './ui_blocks.mjs';
+import { buildUiStandaloneBodyHtml, parseUiProgram } from './ui_blocks.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,6 +88,10 @@ function publicState(serverPort) {
               apiBaseUrl: `http://127.0.0.1:${serverPort}`,
             })
           : null;
+      const validSecretFile =
+        item.kind === 'secret' && item.secretFile && existsSync(item.secretFile)
+          ? item.secretFile
+          : null;
       return {
         id: item.id,
         kind: item.kind,
@@ -97,7 +101,13 @@ function publicState(serverPort) {
         awaitAnswer: item.awaitAnswer,
         status: item.status,
         summary: item.summary ?? null,
-        answerData: item.kind === 'secret' ? null : (item.answerData ?? null),
+        answerData:
+          item.kind === 'secret'
+            ? validSecretFile
+              ? { status: 'saved', file: validSecretFile }
+              : null
+            : (item.answerData ?? null),
+        secretFile: validSecretFile,
         annotations: item.annotations ?? [],
         html: item.html ?? null,
         renderedDoc,
@@ -136,10 +146,19 @@ async function loadStateFromDisk() {
     const parsed = JSON.parse(raw);
     if (parsed && Array.isArray(parsed.items)) {
       state.theme = parsed.theme === 'light' ? 'light' : 'dark';
-      state.items = parsed.items.map((item) => ({
-        ...item,
-        status: item.status === 'waiting' ? 'cancelled' : item.status,
-      }));
+      const secretFiles = await fs.readdir(SECRETS_DIR).catch(() => []);
+      const singleSecretPath =
+        secretFiles.length === 1 ? path.join(SECRETS_DIR, secretFiles[0]) : null;
+      state.items = parsed.items.map((item) => {
+        const next = {
+          ...item,
+          status: item.status === 'waiting' ? 'cancelled' : item.status,
+        };
+        if (next.kind === 'secret' && next.status === 'answered' && !next.secretFile && singleSecretPath) {
+          next.secretFile = singleSecretPath;
+        }
+        return next;
+      });
       state.activeId = parsed.activeId || state.items[0]?.id || null;
     }
   } catch {
@@ -204,10 +223,16 @@ function sendJson(res, statusCode, payload) {
 }
 
 async function writeStandaloneEmbedPage(item, serverPort) {
-  if (item.kind !== 'html' || !item.html) return null;
+  let rawBody = null;
+  if (item.kind === 'html' && item.html) {
+    rawBody = item.html;
+  } else if (item.kind === 'ui' && item.uiAst) {
+    rawBody = buildUiStandaloneBodyHtml(item.uiAst, item.title);
+  }
+  if (!rawBody) return null;
   await fs.mkdir(PAGES_DIR, { recursive: true });
   const filePath = path.join(PAGES_DIR, `${item.id}.html`);
-  const doc = buildHtmlRenderDocument(item.html, {
+  const doc = buildHtmlRenderDocument(rawBody, {
     appearance: state.theme,
     answerState: {
       waiting: item.status === 'waiting',
@@ -269,12 +294,18 @@ export async function startBrokerServer() {
       if (req.method === 'GET' && pathname.startsWith('/api/pages/')) {
         const id = pathname.slice('/api/pages/'.length).replace(/\.html$/i, '');
         const item = state.items.find((i) => i.id === id);
-        if (!item || item.kind !== 'html') {
+        const rawBody =
+          item?.kind === 'html'
+            ? item.html
+            : item?.kind === 'ui' && item.uiAst
+              ? buildUiStandaloneBodyHtml(item.uiAst, item.title)
+              : null;
+        if (!item || !rawBody) {
           res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('Page not found');
           return;
         }
-        const doc = buildHtmlRenderDocument(item.html, {
+        const doc = buildHtmlRenderDocument(rawBody, {
           appearance: state.theme,
           answerState: {
             waiting: item.status === 'waiting',
@@ -414,19 +445,22 @@ export async function startBrokerServer() {
             uiSource: rawUi,
             uiAst: parsedUi.ast,
             uiErrors: null,
+            embedPath: null,
           };
+          const embedPath = await writeStandaloneEmbedPage(item, serverPort).catch(() => null);
+          item.embedPath = embedPath;
           addItem(item, serverPort);
 
           if (!awaitAnswer) {
             sendJson(res, 200, {
               ok: true,
-              data: { id, shown: true, title, note: SHOWN_NOTE },
+              data: { id, shown: true, title, embedPath, note: SHOWN_NOTE },
             });
             return;
           }
 
           const answerResult = await waitForItemResolution(id, req);
-          sendJson(res, 200, { ok: true, data: answerResult });
+          sendJson(res, 200, { ok: true, data: { ...answerResult, embedPath } });
           return;
         }
 
@@ -707,6 +741,7 @@ export async function startBrokerServer() {
           item.id,
           {
             status: 'answered',
+            secretFile: file,
             summary: `Saved ${item.title} to private 0600 file (24h TTL)`,
           },
           serverPort,

@@ -494,3 +494,193 @@ export function parseUiProgram(rawSource) {
     ast: errors.length === 0 ? root : null,
   };
 }
+
+export function buildUiStandaloneBodyHtml(uiAst, title = 'Interactive Decision') {
+  const safeAstJson = JSON.stringify(uiAst || null).replace(/</g, '\\u003c');
+  const safeTitle = String(title || 'Interactive Decision')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return `<div class="oc-surface" style="max-width:720px;margin:0 auto;">
+  <div id="oc-ui-standalone" style="display:flex;flex-direction:column;gap:12px;"></div>
+</div>
+<script>
+(() => {
+  const ast = ${safeAstJson};
+  const mount = document.getElementById('oc-ui-standalone');
+  if (!ast || !mount) return;
+  const values = {};
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  };
+  function renderNode(node) {
+    if (!node || typeof node !== 'object' || node.type !== 'element') return document.createDocumentFragment();
+    const p = node.props || {};
+    switch (node.typeName) {
+      case 'Stack': {
+        const d = el('div');
+        d.style.cssText = 'display:flex;flex-direction:column;gap:10px;';
+        (p.children || []).forEach((c) => d.appendChild(renderNode(c)));
+        return d;
+      }
+      case 'Row': {
+        const d = el('div');
+        d.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;';
+        (p.children || []).forEach((c) => {
+          const w = renderNode(c);
+          if (w.style) w.style.flex = '1 1 180px';
+          d.appendChild(w);
+        });
+        return d;
+      }
+      case 'Card': {
+        const d = el('div', 'oc-box');
+        d.style.cssText = 'display:flex;flex-direction:column;gap:10px;';
+        if (p.title) {
+          const h = el('div', null, p.title);
+          h.style.cssText = 'font-weight:600;font-size:14px;';
+          d.appendChild(h);
+        }
+        (p.children || []).forEach((c) => d.appendChild(renderNode(c)));
+        return d;
+      }
+      case 'Details': {
+        const d = el('details', 'oc-box');
+        const s = el('summary', null, p.title || 'Details');
+        s.style.cssText = 'font-weight:600;cursor:pointer;';
+        d.appendChild(s);
+        const b = el('div');
+        b.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:8px;';
+        (p.children || []).forEach((c) => b.appendChild(renderNode(c)));
+        d.appendChild(b);
+        return d;
+      }
+      case 'Text':
+        return el('div', null, p.markdown || '');
+      case 'Badge': {
+        const b = el('span', 'oc-badge', p.label || '');
+        if (p.tone) b.setAttribute('data-tone', p.tone);
+        return b;
+      }
+      case 'Callout': {
+        const d = el('div', 'oc-box');
+        if (p.title) {
+          const t = el('div', null, p.title);
+          t.style.fontWeight = '600';
+          d.appendChild(t);
+        }
+        d.appendChild(el('div', null, p.markdown || ''));
+        return d;
+      }
+      case 'Stat': {
+        const d = el('div', 'oc-box');
+        const l = el('div', null, p.label || '');
+        l.style.cssText = 'font-size:12px;color:var(--muted-foreground);';
+        const v = el('div', null, p.value ?? '');
+        v.style.cssText = 'font-size:20px;font-weight:700;margin-top:2px;';
+        d.append(l, v);
+        if (p.delta) {
+          const b = el('span', 'oc-badge', p.delta);
+          if (p.tone) b.setAttribute('data-tone', p.tone);
+          d.appendChild(b);
+        }
+        return d;
+      }
+      case 'KeyValue': {
+        const d = el('div', 'oc-box');
+        (p.items || []).forEach((item) => {
+          const r = el('div');
+          r.style.cssText = 'display:flex;justify-content:space-between;gap:12px;padding:4px 0;';
+          const k = el('span', null, item.label ?? '');
+          k.style.color = 'var(--muted-foreground)';
+          const v = el('span', null, item.value ?? '');
+          v.style.fontWeight = '500';
+          r.append(k, v);
+          d.appendChild(r);
+        });
+        return d;
+      }
+      case 'Table': {
+        const t = el('table', 'oc-table');
+        const thead = el('thead');
+        const trh = el('tr');
+        (p.columns || []).forEach((col) => trh.appendChild(el('th', null, col)));
+        thead.appendChild(trh);
+        t.appendChild(thead);
+        const tbody = el('tbody');
+        (p.rows || []).forEach((row) => {
+          const tr = el('tr');
+          (Array.isArray(row) ? row : []).forEach((cell) => tr.appendChild(el('td', null, cell ?? '')));
+          tbody.appendChild(tr);
+        });
+        t.appendChild(tbody);
+        return t;
+      }
+      case 'Choice': {
+        const wrap = el('div', 'oc-field');
+        if (p.label) wrap.appendChild(el('label', null, p.label));
+        const list = el('div', 'oc-options');
+        const multi = Boolean(p.multiple);
+        values[p.name] = multi ? [] : '';
+        (p.options || []).forEach((rawOpt) => {
+          const opt = typeof rawOpt === 'string' ? { label: rawOpt } : (rawOpt || { label: '' });
+          const btn = el('button', 'oc-option');
+          btn.type = 'button';
+          const titleSpan = el('div', null, opt.label);
+          titleSpan.style.fontWeight = '500';
+          btn.appendChild(titleSpan);
+          if (opt.description) {
+            const desc = el('div', null, opt.description);
+            desc.style.cssText = 'font-size:12px;color:var(--muted-foreground);';
+            btn.appendChild(desc);
+          }
+          btn.addEventListener('click', () => {
+            if (multi) {
+              const arr = Array.isArray(values[p.name]) ? values[p.name] : [];
+              const idx = arr.indexOf(opt.label);
+              if (idx >= 0) { arr.splice(idx, 1); btn.removeAttribute('data-selected'); }
+              else { arr.push(opt.label); btn.setAttribute('data-selected', 'true'); }
+            } else {
+              values[p.name] = opt.label;
+              list.querySelectorAll('.oc-option').forEach((o) => o.removeAttribute('data-selected'));
+              btn.setAttribute('data-selected', 'true');
+            }
+          });
+          list.appendChild(btn);
+        });
+        wrap.appendChild(list);
+        return wrap;
+      }
+      case 'TextInput': {
+        const wrap = el('div', 'oc-field');
+        if (p.label) wrap.appendChild(el('label', null, p.label));
+        const inp = el(p.multiline ? 'textarea' : 'input', 'oc-input');
+        if (p.placeholder) inp.placeholder = p.placeholder;
+        values[p.name] = '';
+        inp.addEventListener('input', () => { values[p.name] = inp.value; });
+        wrap.appendChild(inp);
+        return wrap;
+      }
+      case 'Button': {
+        const b = el('button', 'oc-button', p.label || 'Submit');
+        b.type = 'button';
+        if (p.tone === 'primary' || !p.tone) b.setAttribute('data-variant', 'primary');
+        b.addEventListener('click', () => {
+          const action = p.action || p.label || 'submit';
+          if (window.openchamber && typeof window.openchamber.submit === 'function') {
+            window.openchamber.submit({ action, values }, '${safeTitle}: ' + (p.label || action));
+          }
+        });
+        return b;
+      }
+      default:
+        return document.createDocumentFragment();
+    }
+  }
+  mount.appendChild(renderNode(ast));
+})();
+</script>`;
+}

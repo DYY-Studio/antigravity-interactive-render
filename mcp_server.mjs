@@ -69,7 +69,7 @@ async function getSidecarPort() {
 
   // Spawn sidecar broker in background if not started yet
   const child = spawn(process.execPath, [SIDECAR_SCRIPT, '--daemon'], {
-    cwd: path.dirname(SIDECAR_SCRIPT),
+    cwd: os.homedir(),
     detached: true,
     stdio: 'ignore',
   });
@@ -106,7 +106,7 @@ const TOOLS = [
         ui: {
           type: 'string',
           description:
-            'Declarative openui-lang program (without code fences) or JSON AST. Root is `Stack([...])`. ' +
+            'Declarative openui-lang program (without code fences) or JSON AST. Root is `Stack([...])` or `root = Stack([...])`. Both positional arguments and `key: value` / `key = value` named arguments are supported. ' +
             'Components: Stack(children), Row(children), Card(title, children), Tabs(tabs), Tab(label, children), Details(title, children), ' +
             'Text(markdown), Badge(label, tone?), Callout(markdown, tone?, title?), KeyValue(items: [{label, value}]), ' +
             'Table(columns, rows), Steps(items: [{title, markdown?, status?: "done"|"current"|"todo"|"blocked"}]), ' +
@@ -241,6 +241,7 @@ async function handleToolCall(name, rawArgs = {}) {
         status: i.status,
         summary: i.summary,
         answerData: i.answerData,
+        secretFile: i.secretFile ?? null,
         annotations: i.annotations,
         embedPath: i.embedPath,
         updatedAt: i.updatedAt,
