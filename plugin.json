@@ -1,0 +1,12 @@
+{
+  "name": "interactive-render",
+  "displayName": "Interactive Render & Secret Vault",
+  "description": "Two-way interactive HTML & UI block canvas (awaitAnswer), visual mockup annotation, and zero-context secret request vault for Antigravity 2.0.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Render an interactive architecture comparison form with awaitAnswer so I can pick the options",
+    "Draw an HTML mockup in the Interactive Render canvas and wait for my visual annotations or selection",
+    "Request a deployment API token securely via request_secret without exposing it in chat"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "interactive-render": {
+      "command": "node",
+      "args": ["${PLUGIN_PATH}/mcp_server.mjs"]
+    }
+  }
+}
