@@ -227,6 +227,12 @@ async function startServer() {
 
     try {
       // 1. Static UI files
+      if (req.method === 'GET' && pathname === '/favicon.ico') {
+        const svg = await fs.readFile(path.join(__dirname, '..', '..', 'assets', 'logo.svg'), 'utf8').catch(() => '');
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'max-age=86400' });
+        res.end(svg);
+        return;
+      }
       if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
         const html = await fs.readFile(path.join(__dirname, 'index.html'), 'utf8');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
